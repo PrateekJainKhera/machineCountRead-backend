@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+opencv-python
+easyocr
+ultralytics
+numpy
+sqlalchemy
+pyodbc
+torch
+torchvision
+pydantic
+python-multipart
+
