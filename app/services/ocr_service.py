@@ -11,6 +11,7 @@ from vision.camera_manager import CameraManager
 from vision.ocr_reader import OCRReader, OCRResult, DetectedNumber, JobCardResult
 from app.models.ocr_model import ROIConfig
 from app.utils.counter_validator import validate_reading, ValidationResult
+from app.utils import jobcard as jc_util
 
 logger = logging.getLogger(__name__)
 
@@ -498,18 +499,14 @@ class OCRService:
             "pending": None,
         })
 
-        def _core(v: Optional[str]) -> str:
-            # Digits are the stable part of a job number at camera distance —
-            # small prefix letters ("JC-") drop in and out between reads.
-            # Compare on the digit sequence so "JC-4521" and "4521" confirm
-            # each other instead of deadlocking the pending slot.
-            return "".join(ch for ch in (v or "") if ch.isdigit())
+        _core = jc_util.core  # digit-only identity (prefix letters flicker)
 
         if jc.success and jc.value:
             if state["present"] and _core(state["value"]) == _core(jc.value):
-                # Same card still in place — refresh (keep the LONGER form of
-                # the value: "JC-4521" beats "4521")
-                if len(jc.value) > len(state["value"] or ""):
+                # Same card still in place — refresh, keeping the CLEANEST form.
+                # "JC-4521" (clean) beats a misread like "JBCA4521" even though
+                # the misread is longer.
+                if jc_util.score(jc.value) > jc_util.score(state["value"]):
                     state["value"] = jc.value
                 state.update({
                     "confidence": jc.confidence, "source": jc.source,
@@ -520,8 +517,9 @@ class OCRService:
                 # no confirmation needed) or the same digit-core twice in a row.
                 # Single-frame flickers ("JQ8PB1088") can never displace the
                 # stable value — they don't repeat.
+                is_change = state["value"] is not None
                 logger.info(
-                    f"[{camera_id}] JOB CARD {'placed' if state['value'] is None else 'changed'}: "
+                    f"[{camera_id}] JOB CARD {'changed' if is_change else 'placed'}: "
                     f"{state['value']} → {jc.value} (source={jc.source}, conf={jc.confidence:.2f})"
                 )
                 state.update({
@@ -534,6 +532,12 @@ class OCRService:
                     "misses": 0,
                     "pending": None,
                 })
+                # The job card is the RESET AUTHORITY. A new job means the
+                # per-job counter restarts at 0 — clear the counter baseline so
+                # that reset is accepted immediately instead of being fought as
+                # a backwards jump. (A reset WITHOUT a card change stays
+                # suspicious — that path is unchanged.)
+                self._reset_counter_baseline(camera_id)
             else:
                 # First sighting of a different value — hold as pending until
                 # the next read confirms it. A card IS visible, so no miss.
@@ -548,6 +552,21 @@ class OCRService:
                     f"(after {state['misses']} consecutive misses) — job finished."
                 )
                 state["present"] = False
+                # Job ended — next job's counter starts fresh at 0.
+                self._reset_counter_baseline(camera_id)
+
+    def _reset_counter_baseline(self, camera_id: str) -> None:
+        """
+        Clear the counter validation baseline for a camera. The next reading is
+        treated as a fresh first reading, so a per-job reset to 0 is accepted
+        cleanly. Does NOT clear the cached UI value (_latest_valid) — the UI
+        keeps showing the last number until the new job's first value confirms.
+        """
+        self._last_accepted.pop(camera_id, None)
+        self._first_pending.pop(camera_id, None)
+        self._reject_streaks.pop(camera_id, None)
+        self._rate_history[camera_id] = deque(maxlen=RATE_HISTORY_SIZE)
+        logger.info(f"[{camera_id}] Counter baseline reset (job boundary).")
 
     def get_jobcard_state(self, camera_id: str) -> Optional[dict]:
         """

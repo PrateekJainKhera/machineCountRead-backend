@@ -5,8 +5,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.routes import ocr as ocr_router
 from app.routes import downtime as downtime_router
+from app.routes import job as job_router
 from app.services.ocr_service import OCRService
 from app.services.downtime_service import DowntimeService
+from app.services.job_service import JobService
+from app.db.database import init_db
 
 # ------------------------------------------------------------------
 # Logging setup
@@ -25,13 +28,16 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("=== Machine Count Read Backend Starting ===")
+    init_db()  # SQLite by default, MS SQL via MCR_DATABASE_URL
     app.state.ocr_service = OCRService()  # EasyOCR model loads here
     app.state.downtime_service = DowntimeService(app.state.ocr_service)
+    app.state.job_service = JobService(app.state.ocr_service)
     logger.info("=== Startup complete. Ready to accept requests. ===")
 
     yield  # App runs here
 
     logger.info("=== Machine Count Read Backend Shutting Down ===")
+    app.state.job_service.shutdown()
     app.state.downtime_service.shutdown()
     app.state.ocr_service.shutdown()
 
@@ -64,6 +70,7 @@ app.add_middleware(
 # ------------------------------------------------------------------
 app.include_router(ocr_router.router)
 app.include_router(downtime_router.router)
+app.include_router(job_router.router)
 
 
 # ------------------------------------------------------------------

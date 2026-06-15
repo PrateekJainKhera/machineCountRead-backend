@@ -99,16 +99,18 @@ def validate_reading(
     elapsed_seconds = (current_timestamp - prev_timestamp).total_seconds()
     delta = new_value - prev_value
 
-    # ── Check 2a: Direction — counter must not go backwards ───────────
-    # ONLY small backwards deltas (OCR noise on the last digit) are accepted.
-    # EVERY larger backwards jump is rejected here — including drops to near
-    # zero. A partial read of a soft frame ("1359" → "39") looks exactly like
-    # a counter reset, so resets get NO free pass on a single reading.
-    # Real resets (job change → counter back to 0, counting up) are adopted by
-    # the service-level rejection-streak recovery after several consecutive
-    # consistent readings; partial reads don't repeat, so they never qualify.
-    noise_tolerance = 20  # OCR can misread last 1-2 digits (e.g. 18929→18917 is noise/loop)
-    direction_ok = delta >= -noise_tolerance
+    # ── Check 2a: Direction — counter is MONOTONIC, never goes backwards ──
+    # A production counter only increases within a job. So ANY reading below the
+    # last accepted value is a misread — most importantly the 8→0 / 8→6 digit
+    # confusion (1368 read as 1360 or 1366), which makes the number SMALLER and
+    # is caught here on physics alone, no model training needed.
+    # Equal (delta == 0, machine paused) and forward (delta > 0) are allowed;
+    # forward misreads are caught by the rate check below using the machine's
+    # max speed. Job resets to 0 are handled at the service layer (the job card
+    # change clears the baseline), and a genuine reset that slips through is
+    # adopted by rejection-streak recovery. So here: strictly no going backwards.
+    BACKWARD_TOLERANCE = 0
+    direction_ok = delta >= -BACKWARD_TOLERANCE
 
     if not direction_ok:
         return ValidationResult(
@@ -119,7 +121,7 @@ def validate_reading(
             digit_count_ok=True,
             reason=(
                 f"Counter went backwards: {prev_value} → {new_value} (delta={delta}). "
-                f"Rejected — partial read or reset; consistent repeats will be adopted."
+                f"Rejected — counter only increases; this is a digit misread (e.g. 8→0)."
             ),
         )
 
