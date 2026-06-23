@@ -22,6 +22,10 @@ JOB_END_GRACE_S = 25.0
 # so the job doesn't fragment or backdate.
 SUSPEND_GAP_S = 30.0
 
+# An "active" session in the DB is RESUMED on restart if it started within this
+# many hours (a restart isn't a job boundary). Older ones are closed as stale.
+RESUME_MAX_AGE_H = 18.0
+
 _core = jc_util.core
 
 
@@ -48,6 +52,9 @@ class JobService:
         self._sessions: List[dict] = []
         self._next_mem_id = 1
         self._last_tick = None  # for suspend/sleep detection
+        # camera_id → digit-core of a card that was just End-Job'd and is STILL
+        # in the slot — don't auto-reopen it until the card is removed/changed.
+        self._ended_card: Dict[str, str] = {}
 
         self._load_history()
 
@@ -64,26 +71,37 @@ class JobService:
         if not is_enabled():
             return
         try:
+            now = datetime.now()
             with session_scope() as s:
                 if s is None:
                     return
                 rows = s.query(JobSessionRow).order_by(JobSessionRow.id.desc()).limit(200).all()
-                orphans = 0
+                resumed = stale = 0
                 for r in rows:
-                    # A session left "active" belongs to a previous run that
-                    # didn't shut down cleanly. Close it now so it doesn't show
-                    # as RUNNING forever (it can never be tracked again).
                     if r.status == "active":
+                        age_h = (now - r.started_at).total_seconds() / 3600 if r.started_at else 999
+                        if age_h <= RESUME_MAX_AGE_H:
+                            # RESUME across restart — a restart is not a job
+                            # boundary. Reattach so the SAME job continues (and
+                            # can be closed normally) instead of fragmenting into
+                            # a new row when the camera reconnects.
+                            d = self._row_to_dict(r)
+                            d["absent_since"] = None
+                            self._sessions.append(d)
+                            self._active[r.camera_id] = d
+                            resumed += 1
+                            continue
+                        # Too old to resume (e.g. crashed days ago) → close stale.
                         r.status = "completed"
                         if r.ended_at is None:
                             r.ended_at = r.started_at
-                        orphans += 1
+                        stale += 1
                     self._sessions.append(self._row_to_dict(r))
                 if rows:
                     self._next_mem_id = max(r.id for r in rows) + 1
             logger.info(
                 f"JobService loaded {len(self._sessions)} job sessions from DB "
-                f"({orphans} stale 'active' closed)."
+                f"({resumed} resumed across restart, {stale} stale-closed)."
             )
         except Exception as e:
             logger.warning(f"JobService history load failed: {e}")
@@ -135,26 +153,29 @@ class JobService:
 
                 if present and value:
                     if active is None:
+                        if self._ended_card.get(camera_id) == _core(value):
+                            # This card was just End-Job'd and is still sitting in
+                            # the slot — wait until it's removed (or a different
+                            # card placed) before starting a fresh job.
+                            continue
                         self._open(camera_id, value, now, counter)
                     elif _core(active["job_card"]) != _core(value):
                         # A genuinely DIFFERENT card → job changed: close + open.
                         self._close(camera_id, now)
                         self._open(camera_id, value, now, counter)
                     else:
-                        # Same job — card present (or recovered from a dropout).
+                        # Same job — card present (or back after a pause/dropout).
                         active["absent_since"] = None
                         if jc_util.score(value) > jc_util.score(active["job_card"]):
                             active["job_card"] = value  # keep cleanest form (JC-4521)
                         self._track_counter(active, counter)
                 else:
-                    # Card not visible. A brief dropout (QR glare/blur) must NOT
-                    # end the job — only a SUSTAINED absence does. Otherwise one
-                    # continuous job fragments into several sessions.
-                    if active is not None:
-                        if active.get("absent_since") is None:
-                            active["absent_since"] = now
-                        elif (now - active["absent_since"]).total_seconds() >= JOB_END_GRACE_S:
-                            self._close(camera_id, now)
+                    # Card not visible → the job STAYS ACTIVE (paused). A break,
+                    # breakdown, or the card removed for a while does NOT end the
+                    # job or create a new row — the counter just pauses/resumes.
+                    # A job ends ONLY via "End Job" or a DIFFERENT card.
+                    # The card is gone, so clear any End-Job hold.
+                    self._ended_card.pop(camera_id, None)
 
     def _track_counter(self, sess: dict, counter: Optional[int]):
         if counter is None:
@@ -184,6 +205,7 @@ class JobService:
         self._next_mem_id += 1
         self._active[camera_id] = sess
         self._sessions.insert(0, sess)
+        self._ended_card.pop(camera_id, None)
         logger.info(f"[{sess['machine_id']}] JOB START: {job_card} (counter={counter})")
         self._persist_open(sess)
 
@@ -239,6 +261,23 @@ class JobService:
         except Exception as e:
             logger.warning(f"Job close persist failed: {e}")
 
+    def _persist_progress(self, sess: dict):
+        """Save the running counter/production but keep the session ACTIVE —
+        so a restart can resume it with the latest figures."""
+        if not is_enabled() or sess.get("db_id") is None:
+            return
+        try:
+            with session_scope() as s:
+                if s is None:
+                    return
+                row = s.get(JobSessionRow, sess["db_id"])
+                if row:
+                    row.start_counter = sess["start_counter"]
+                    row.end_counter = sess["end_counter"]
+                    row.production = sess["production"]
+        except Exception as e:
+            logger.warning(f"Job progress persist failed: {e}")
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -257,9 +296,13 @@ class JobService:
         return out[:limit]
 
     def end_current(self, camera_id: str) -> bool:
-        """Manually close the active job for a camera (operator override)."""
+        """Manually end the active job (the ONLY normal way a job ends, besides a
+        different card being placed). Holds the just-ended card so it doesn't
+        auto-reopen while still in the slot."""
         with self._lock:
-            if camera_id in self._active:
+            sess = self._active.get(camera_id)
+            if sess is not None:
+                self._ended_card[camera_id] = _core(sess["job_card"])
                 self._close(camera_id, datetime.now())
                 return True
             return False
@@ -268,9 +311,10 @@ class JobService:
         self._running = False
         if self._thread.is_alive():
             self._thread.join(timeout=5)
-        # Close any open sessions so production isn't lost on shutdown
-        now = datetime.now()
+        # Do NOT close active sessions — a restart is not a job boundary. Persist
+        # their latest progress and leave them ACTIVE so they RESUME on restart
+        # (one row per real job run, not one per restart).
         with self._lock:
-            for camera_id in list(self._active.keys()):
-                self._close(camera_id, now)
+            for sess in self._active.values():
+                self._persist_progress(sess)
         logger.info("JobService shut down.")

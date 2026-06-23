@@ -363,6 +363,36 @@ class OCRService:
                 mode = self._preprocess_modes.get(camera_id, "otsu")
                 is_video_test = cam._is_video_file and not cam._loop
 
+                # ── Job card first, then GATE the counter on it ────────────────
+                # The counter only means something while a job is loaded. Read
+                # the job card; if a job card ROI is configured but NO card is
+                # present (between jobs), PAUSE counter OCR until the next card
+                # appears. Job-card detection keeps running so the new card is
+                # caught — only the counter read is paused.
+                cycle += 1
+                if camera_id in self._jobcard_rois:
+                    jc_state = self._jobcard_state.get(camera_id)
+                    change_in_progress = bool(jc_state) and (
+                        jc_state.get("pending") is not None
+                        or (jc_state.get("present") and jc_state.get("misses", 0) > 0)
+                    )
+                    card_present = bool(jc_state and jc_state.get("present"))
+                    # No card present → check EVERY cycle so the next card is
+                    # caught fast; otherwise the normal periodic cadence.
+                    if (not card_present) or change_in_progress or cycle % JOBCARD_POLL_EVERY == 1:
+                        jc_frame = cam.get_frame()
+                        if jc_frame is not None:
+                            self._update_jobcard_state(camera_id, jc_frame)
+                        card_present = bool((self._jobcard_state.get(camera_id) or {}).get("present"))
+
+                    if not card_present:
+                        # No job loaded → PAUSE counter OCR. Drop the cached
+                        # reading so the UI shows no value and nothing is logged
+                        # against a non-existent job.
+                        self._latest_valid.pop(camera_id, None)
+                        time.sleep(poll_interval)
+                        continue
+
                 if is_video:
                     # ── Video mode: single frame read ─────────────────────────────
                     # Video files use fast polling (0.2s) to catch every counter change.
@@ -412,22 +442,6 @@ class OCRService:
                         sharpness_threshold=sharp_thr, preprocess_mode=mode,
                     )
                     min_conf = LIVE_MIN_CONFIDENCE
-
-                # ── Job card read ──────────────────────────────────────────────
-                # Normally every Nth cycle (card is static). When a change is
-                # in progress (pending value or misses counting), read EVERY
-                # cycle so swaps and removals resolve in seconds.
-                cycle += 1
-                if camera_id in self._jobcard_rois:
-                    jc_state = self._jobcard_state.get(camera_id)
-                    change_in_progress = bool(jc_state) and (
-                        jc_state.get("pending") is not None
-                        or (jc_state.get("present") and jc_state.get("misses", 0) > 0)
-                    )
-                    if change_in_progress or cycle % JOBCARD_POLL_EVERY == 1:
-                        jc_frame = cam.get_frame()
-                        if jc_frame is not None:
-                            self._update_jobcard_state(camera_id, jc_frame)
 
                 if result.success and result.value is not None:
                     result, validation = self._run_validation(
