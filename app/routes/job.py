@@ -10,6 +10,21 @@ def _svc(request: Request):
     return request.app.state.job_service
 
 
+@router.post("/start/{camera_id}", response_model=JobSessionModel)
+def start_job(camera_id: str, request: Request):
+    """Operator 'Start Job' — open a session for the job card currently in the slot.
+
+    Idempotent: returns the running job if one already auto-started. 400 if no
+    readable job card is present (nothing to identify the job)."""
+    sess = _svc(request).start_job(camera_id)
+    if sess is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No job card detected — place a job card in the slot, then Start Job.",
+        )
+    return sess
+
+
 @router.post("/end/{camera_id}")
 def end_current(camera_id: str, request: Request):
     """Manually end the active job on a machine (operator override)."""

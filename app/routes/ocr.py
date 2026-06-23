@@ -80,6 +80,16 @@ def stop_ocr(camera_id: str, request: Request):
     return {"message": f"OCR polling stopped for camera '{camera_id}'."}
 
 
+@router.post("/cameras/{camera_id}/start-ocr")
+def start_ocr(camera_id: str, request: Request):
+    """(Re)start background OCR polling for an already-registered camera."""
+    service = _get_service(request)
+    started = service.start_ocr(camera_id)
+    if not started:
+        raise HTTPException(status_code=404, detail=f"Camera '{camera_id}' not found.")
+    return {"message": f"OCR polling started for camera '{camera_id}'."}
+
+
 @router.put("/cameras/{camera_id}/roi", response_model=RegisterCameraResponse)
 def update_roi(camera_id: str, roi: ROIConfig, request: Request):
     """Update the Region of Interest for a registered camera."""

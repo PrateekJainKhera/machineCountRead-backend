@@ -12,6 +12,11 @@ logger = logging.getLogger(__name__)
 
 TICK_S = 2.0
 
+# How often (in ticks) to flush a running job's live counter/production to the DB
+# so an ACTIVE row reflects current figures instead of NULL until it closes.
+# 5 ticks × 2s = every ~10s.
+PROGRESS_PERSIST_TICKS = 5
+
 # The job card must be GONE this long before the job is considered finished.
 # Tolerates brief QR/text read dropouts (glare, blur, a hand passing) so one
 # continuous job doesn't split into multiple sessions. A real job change to a
@@ -52,6 +57,7 @@ class JobService:
         self._sessions: List[dict] = []
         self._next_mem_id = 1
         self._last_tick = None  # for suspend/sleep detection
+        self._tick_count = 0    # for periodic progress persistence
         # camera_id → digit-core of a card that was just End-Job'd and is STILL
         # in the slot — don't auto-reopen it until the card is removed/changed.
         self._ended_card: Dict[str, str] = {}
@@ -176,6 +182,14 @@ class JobService:
                     # A job ends ONLY via "End Job" or a DIFFERENT card.
                     # The card is gone, so clear any End-Job hold.
                     self._ended_card.pop(camera_id, None)
+
+            # Periodically flush running jobs so the DB row shows live
+            # counter/production (and a late start_counter) instead of NULL
+            # until the job finally closes.
+            self._tick_count += 1
+            if self._tick_count % PROGRESS_PERSIST_TICKS == 0:
+                for sess in self._active.values():
+                    self._persist_progress(sess)
 
     def _track_counter(self, sess: dict, counter: Optional[int]):
         if counter is None:
@@ -304,6 +318,41 @@ class JobService:
             if sess is not None:
                 self._ended_card[camera_id] = _core(sess["job_card"])
                 self._close(camera_id, datetime.now())
+                return True
+            return False
+
+    def start_job(self, camera_id: str) -> Optional[dict]:
+        """Operator 'Start Job' — open a session for the card currently in the slot.
+
+        Idempotent and coexists with the automatic card-driven start: if a job is
+        already running it just returns it; otherwise it captures the current job
+        card value + counter as the baseline and opens one. Returns None if no
+        readable job card is present (nothing to identify the job with)."""
+        with self._lock:
+            active = self._active.get(camera_id)
+            if active is not None:
+                return dict(active)  # already running (auto-started or manual)
+            jc = self._ocr.get_jobcard_state(camera_id) or {}
+            value = jc.get("value") if jc.get("present") else None
+            if not value:
+                return None  # no card → can't identify the job
+            cached = self._ocr.get_latest_reading(camera_id)
+            counter = cached["result"].value if cached and cached.get("result") else None
+            self._ended_card.pop(camera_id, None)  # clear any End-Job hold
+            self._open(camera_id, value, datetime.now(), counter)
+            return dict(self._active.get(camera_id))
+
+    def close_active(self, camera_id: str) -> bool:
+        """Finalise the active job when a machine is DISABLED or REMOVED.
+
+        Unlike end_current, this does NOT set the End-Job hold — turning the
+        machine off cleanly closes the job (recording its end_counter/production),
+        and re-enabling it with a card present begins a fresh job. Prevents the
+        stranded ACTIVE/NULL rows seen when a machine is switched off."""
+        with self._lock:
+            if camera_id in self._active:
+                self._close(camera_id, datetime.now())
+                self._ended_card.pop(camera_id, None)
                 return True
             return False
 

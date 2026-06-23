@@ -6,9 +6,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.routes import ocr as ocr_router
 from app.routes import downtime as downtime_router
 from app.routes import job as job_router
+from app.routes import machine as machine_router
 from app.services.ocr_service import OCRService
 from app.services.downtime_service import DowntimeService
 from app.services.job_service import JobService
+from app.services.machine_service import MachineService
 from app.db.database import init_db
 
 # ------------------------------------------------------------------
@@ -32,6 +34,12 @@ async def lifespan(app: FastAPI):
     app.state.ocr_service = OCRService()  # EasyOCR model loads here
     app.state.downtime_service = DowntimeService(app.state.ocr_service)
     app.state.job_service = JobService(app.state.ocr_service)
+    app.state.machine_service = MachineService(
+        app.state.ocr_service, app.state.downtime_service, app.state.job_service
+    )
+    # Auto-register every enabled machine from the Machine Master so they start
+    # reading on boot — no manual setup after a restart (10-50 machine fleets).
+    app.state.machine_service.register_all_enabled()
     logger.info("=== Startup complete. Ready to accept requests. ===")
 
     yield  # App runs here
@@ -71,6 +79,7 @@ app.add_middleware(
 app.include_router(ocr_router.router)
 app.include_router(downtime_router.router)
 app.include_router(job_router.router)
+app.include_router(machine_router.router)
 
 
 # ------------------------------------------------------------------

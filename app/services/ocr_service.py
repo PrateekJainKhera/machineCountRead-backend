@@ -102,6 +102,20 @@ class OCRService:
             logger.warning(f"YOLO digit model unavailable ({e}) — counter falls back to EasyOCR.")
             self._counter_reader = self._reader
 
+        # Is the fast YOLO reader active, or the slow EasyOCR fallback (~1s/frame)?
+        self._using_yolo = self._counter_reader is not self._reader
+        # Fewer burst frames on the slow EasyOCR path keeps MULTIPLE cameras
+        # responsive (3 frames × ~1s × N cameras saturates the CPU). With YOLO
+        # (fast) we can afford the full 3-frame consensus.
+        self._burst_frames = LIVE_BURST_FRAMES if self._using_yolo else 2
+
+        # Serialises OCR inference across cameras. EasyOCR/torch on CPU is the
+        # bottleneck — letting every camera poller call it at once just thrashes
+        # the CPU and STARVES one camera (so only one counter appears to move).
+        # A single lock makes the cameras take fair, clean turns: higher total
+        # throughput and every machine keeps reading.
+        self._infer_lock = threading.Lock()
+
         self._cameras: Dict[str, CameraManager] = {}
         self._rois: Dict[str, ROI] = {}
 
@@ -248,6 +262,21 @@ class OCRService:
         logger.info(f"OCR polling stopped for camera '{camera_id}' (stream still active).")
         return True
 
+    def start_ocr(self, camera_id: str) -> bool:
+        """
+        (Re)start background OCR polling for a camera that's already registered.
+        Idempotent — does nothing if the poller is already running. Pairs with
+        stop_ocr() to give the operator an explicit Start OCR / Stop OCR control.
+        Returns False if the camera isn't registered.
+        """
+        if camera_id not in self._cameras:
+            return False
+        if self._poll_running.get(camera_id):
+            return True  # already polling
+        self._start_poller(camera_id)
+        logger.info(f"OCR polling started for camera '{camera_id}'.")
+        return True
+
     def unregister_camera(self, camera_id: str) -> bool:
         """Stop and remove a camera (including its poller). Returns False if not found."""
         if camera_id not in self._cameras:
@@ -299,6 +328,7 @@ class OCRService:
             {"x": roi[0], "y": roi[1], "width": roi[2], "height": roi[3]}
             if roi else None
         )
+        status["ocr_running"] = bool(self._poll_running.get(camera_id, False))
         return status
 
     def list_cameras(self) -> list:
@@ -416,11 +446,11 @@ class OCRService:
                     # A digit mid-roll corrupts at most 1 frame; majority vote on the
                     # other 2 correct frames eliminates the misread automatically.
                     frames = []
-                    for i in range(LIVE_BURST_FRAMES):
+                    for i in range(self._burst_frames):
                         f = cam.get_frame()
                         if f is not None:
                             frames.append(f)
-                        if i < LIVE_BURST_FRAMES - 1:
+                        if i < self._burst_frames - 1:
                             time.sleep(LIVE_BURST_GAP)
 
                     if not frames:
@@ -437,10 +467,13 @@ class OCRService:
                         isinstance(cam.source, str) and str(cam.source).isdigit()
                     )
                     sharp_thr = 35.0 if is_local_webcam else 80.0
-                    result = self._counter_reader.read_counter_consensus(
-                        frames, roi=roi, min_confidence=LIVE_MIN_CONFIDENCE,
-                        sharpness_threshold=sharp_thr, preprocess_mode=mode,
-                    )
+                    # Hold the shared inference lock so cameras take fair turns on
+                    # the CPU instead of thrashing/starving each other.
+                    with self._infer_lock:
+                        result = self._counter_reader.read_counter_consensus(
+                            frames, roi=roi, min_confidence=LIVE_MIN_CONFIDENCE,
+                            sharpness_threshold=sharp_thr, preprocess_mode=mode,
+                        )
                     min_conf = LIVE_MIN_CONFIDENCE
 
                 if result.success and result.value is not None:
@@ -505,7 +538,9 @@ class OCRService:
         if roi is None:
             return
 
-        jc: JobCardResult = self._reader.read_jobcard(frame, roi=roi)
+        # Share the inference lock with the counter reader (same CPU-bound EasyOCR).
+        with self._infer_lock:
+            jc: JobCardResult = self._reader.read_jobcard(frame, roi=roi)
         now = datetime.now()
         state = self._jobcard_state.setdefault(camera_id, {
             "value": None, "confidence": 0.0, "source": "none",

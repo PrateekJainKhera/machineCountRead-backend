@@ -329,6 +329,22 @@ class DowntimeService:
             self._persist_update(ev)
             return dict(ev)
 
+    def resolve_active(self, camera_id: str) -> None:
+        """Close any open downtime event for a camera — used when a machine is
+        disabled/removed so it doesn't linger as an active event in the DB."""
+        now = datetime.now()
+        with self._lock:
+            tr = self._track.get(camera_id)
+            if tr and tr.get("active_event_id") is not None:
+                ev = self._get_event(tr["active_event_id"])
+                if ev and ev["status"] == "active":
+                    ev["ended_at"] = now
+                    ev["duration_s"] = round((now - ev["started_at"]).total_seconds(), 1)
+                    ev["status"] = "resolved"
+                    self._persist_update(ev)
+                    logger.info(f"[{camera_id}] Active downtime resolved (machine disabled/removed).")
+                tr["active_event_id"] = None
+
     def set_threshold(self, camera_id: str, seconds: float) -> None:
         with self._lock:
             self._thresholds[camera_id] = max(10.0, float(seconds))
